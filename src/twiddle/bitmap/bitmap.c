@@ -6,7 +6,7 @@
 
 #include "../macrology.h"
 
-#define TW_BYTES_PER_BITMAP sizeof(uint64_t)
+#define TW_BYTES_PER_BITMAP (sizeof(BITMAP_TYPE))
 #define TW_BITS_PER_BITMAP (TW_BYTES_PER_BITMAP * TW_BITS_IN_WORD)
 
 #define BITMAP_POS(pos) (pos / TW_BITS_PER_BITMAP)
@@ -37,9 +37,9 @@ struct tw_bitmap *tw_bitmap_new(uint64_t size)
   }
 
   const size_t data_size =
-      TW_ALLOC_TO_CACHELINE(TW_BITMAP_PER_BITS(size) * TW_BYTES_PER_BITMAP);
+      TW_BITMAP_PER_BITS(size) * TW_BYTES_PER_BITMAP;
 
-  if ((bitmap->data = malloc_aligned(TW_CACHELINE, data_size)) == NULL) {
+  if ((bitmap->data = aligned_alloc(sizeof(BITMAP_TYPE), data_size)) == NULL) {
     free(bitmap);
     return NULL;
   }
@@ -90,12 +90,11 @@ inline void tw_bitmap_set(struct tw_bitmap *bitmap, uint64_t pos)
     return;
   }
 
-  const uint64_t old_bitmap = bitmap->data[BITMAP_POS(pos)];
-  const uint64_t new_bitmap = old_bitmap | MASK(pos);
+  const BITMAP_TYPE old_bitmap = bitmap->data[BITMAP_POS(pos)];
+  const BITMAP_TYPE new_bitmap = old_bitmap | MASK(pos);
   const bool changed = (old_bitmap != new_bitmap);
   bitmap->count += changed;
   bitmap->data[BITMAP_POS(pos)] = new_bitmap;
-  ;
 }
 
 inline void tw_bitmap_clear(struct tw_bitmap *bitmap, uint64_t pos)
@@ -104,8 +103,8 @@ inline void tw_bitmap_clear(struct tw_bitmap *bitmap, uint64_t pos)
     return;
   }
 
-  const uint64_t old_bitmap = bitmap->data[BITMAP_POS(pos)];
-  const uint64_t new_bitmap = old_bitmap & ~MASK(pos);
+  const BITMAP_TYPE old_bitmap = bitmap->data[BITMAP_POS(pos)];
+  const BITMAP_TYPE new_bitmap = old_bitmap & ~MASK(pos);
   const bool changed = (old_bitmap != new_bitmap);
   bitmap->count -= changed;
   bitmap->data[BITMAP_POS(pos)] = new_bitmap;
@@ -126,8 +125,8 @@ bool tw_bitmap_test_and_set(struct tw_bitmap *bitmap, uint64_t pos)
     return false;
   }
 
-  const uint64_t old_bitmap = bitmap->data[BITMAP_POS(pos)];
-  const uint64_t new_bitmap = old_bitmap | MASK(pos);
+  const BITMAP_TYPE old_bitmap = bitmap->data[BITMAP_POS(pos)];
+  const BITMAP_TYPE new_bitmap = old_bitmap | MASK(pos);
   const bool changed = (old_bitmap != new_bitmap);
   bitmap->count += changed;
   bitmap->data[BITMAP_POS(pos)] = new_bitmap;
@@ -140,8 +139,8 @@ bool tw_bitmap_test_and_clear(struct tw_bitmap *bitmap, uint64_t pos)
     return false;
   }
 
-  const uint64_t old_bitmap = bitmap->data[BITMAP_POS(pos)];
-  const uint64_t new_bitmap = old_bitmap & ~MASK(pos);
+  const BITMAP_TYPE old_bitmap = bitmap->data[BITMAP_POS(pos)];
+  const BITMAP_TYPE new_bitmap = old_bitmap & ~MASK(pos);
   const bool changed = (old_bitmap != new_bitmap);
   bitmap->count -= changed;
   bitmap->data[BITMAP_POS(pos)] = new_bitmap;
@@ -214,6 +213,16 @@ struct tw_bitmap *tw_bitmap_fill(struct tw_bitmap *bitmap)
   return bitmap;
 }
 
+static int tw_ctz(BITMAP_TYPE d)
+{
+  BITMAP_TYPE b=1;
+  int pos=0, dbits = sizeof(d)*8;
+  for(pos = 0; pos < dbits && !((b<<pos)&d); pos++)
+    ;
+
+  return pos < dbits ? pos : -1;
+}
+
 int64_t tw_bitmap_find_first_zero(const struct tw_bitmap *bitmap)
 {
   if (!bitmap) {
@@ -229,14 +238,13 @@ int64_t tw_bitmap_find_first_zero(const struct tw_bitmap *bitmap)
     return -1;
   }
 
-  for (size_t i = 0; i < TW_BITMAP_PER_BITS(bitmap->size); ++i) {
-    const int pos = __builtin_ffsll(~bitmap->data[i]);
-    if (pos) {
-      return (i * TW_BITS_PER_BITMAP) + (pos - 1);
-    }
-  }
-
-  return -1;
+  int64_t i;
+  for (i = 0; (i < (int64_t) TW_BITMAP_PER_BITS(bitmap->size)); i++)
+    if(bitmap->data[i] != (BITMAP_TYPE) -1)
+      break;
+  
+  int pos = tw_ctz(~bitmap->data[i]);
+  return pos > 0 ? i * (int) TW_BITS_PER_BITMAP + pos : -1;
 }
 
 int64_t tw_bitmap_find_first_bit(const struct tw_bitmap *bitmap)
@@ -256,14 +264,12 @@ int64_t tw_bitmap_find_first_bit(const struct tw_bitmap *bitmap)
     return -1;
   }
 
-  for (size_t i = 0; i < TW_BITMAP_PER_BITS(bitmap->size); ++i) {
-    const int pos = __builtin_ffsll(bitmap->data[i]);
-    if (pos) {
-      return (i * TW_BITS_PER_BITMAP) + (pos - 1);
-    }
-  }
+  int64_t i;
+  for (i = 0; i < (int64_t) TW_BITMAP_PER_BITS(bitmap->size) && bitmap->data[i] == (BITMAP_TYPE) 0; ++i)
+    ;
 
-  return -1;
+  int pos = tw_ctz(~bitmap->data[i]);
+  return pos > 0 ? i * (int) TW_BITS_PER_BITMAP + pos : -1;
 }
 
 #define VECTORS_IN_BITS(simd_t, n_bits)                                        \
@@ -286,14 +292,14 @@ struct tw_bitmap *tw_bitmap_not(struct tw_bitmap *bitmap)
   const uint64_t size = bitmap->size;
 
 #ifdef USE_AVX512
-  BITMAP_NOT_LOOP(__m512i, _mm512_set1_epi8, _mm512_load_si512,
-                  _mm512_xor_si512, _mm512_store_si512)
+  BITMAP_NOT_LOOP(__m512i, _mm512_set1_epi8, _mm512_loadu_si512,
+                  _mm512_xor_si512, _mm512_storeu_si512)
 #elif defined USE_AVX2
-  BITMAP_NOT_LOOP(__m256i, _mm256_set1_epi8, _mm256_load_si256,
-                  _mm256_xor_si256, _mm256_store_si256)
+  BITMAP_NOT_LOOP(__m256i, _mm256_set1_epi8, _mm256_loadu_si256,
+                  _mm256_xor_si256, _mm256_storeu_si256)
 #elif defined USE_AVX
-  BITMAP_NOT_LOOP(__m128i, _mm_set1_epi8, _mm_load_si128, _mm_xor_si128,
-                  _mm_store_si128)
+  BITMAP_NOT_LOOP(__m128i, _mm_set1_epi8, _mm_loadu_si128, _mm_xor_si128,
+                  _mm_storeu_si128)
 #else
   for (size_t i = 0; i < TW_BITMAP_PER_BITS(size); ++i) {
     bitmap->data[i] ^= ~0UL;
@@ -328,9 +334,9 @@ bool tw_bitmap_equal(const struct tw_bitmap *fst, const struct tw_bitmap *snd)
 
 /* AVX512 does not have movemask_epi8 equivalent, fallback to AVX2 */
 #ifdef USE_AVX2
-  BITMAP_EQ_LOOP(__m256i, _mm256_load_si256, tw_mm256_equal)
+  BITMAP_EQ_LOOP(__m256i, _mm256_loadu_si256, tw_mm256_equal)
 #elif defined USE_AVX
-  BITMAP_EQ_LOOP(__m128i, _mm_load_si128, tw_mm_equal)
+  BITMAP_EQ_LOOP(__m128i, _mm_loadu_si128, tw_mm_equal)
 #else
   for (size_t i = 0; i < TW_BITMAP_PER_BITS(size); ++i) {
     if (fst->data[i] != snd->data[i]) {
@@ -367,13 +373,13 @@ struct tw_bitmap *tw_bitmap_union(const struct tw_bitmap *src,
 
   uint64_t count = 0;
 #ifdef USE_AVX512
-  BITMAP_OP_LOOP(__m512i, _mm512_load_si512, _mm512_or_si512,
-                 _mm512_store_si512)
+  BITMAP_OP_LOOP(__m512i, _mm512_loadu_si512, _mm512_or_si512,
+                 _mm512_storeu_si512)
 #elif defined USE_AVX2
-  BITMAP_OP_LOOP(__m256i, _mm256_load_si256, _mm256_or_si256,
-                 _mm256_store_si256)
+  BITMAP_OP_LOOP(__m256i, _mm256_loadu_si256, _mm256_or_si256,
+                 _mm256_storeu_si256)
 #elif defined USE_AVX
-  BITMAP_OP_LOOP(__m128i, _mm_load_si128, _mm_or_si128, _mm_store_si128)
+  BITMAP_OP_LOOP(__m128i, _mm_loadu_si128, _mm_or_si128, _mm_storeu_si128)
 #else
   for (size_t i = 0; i < TW_BITMAP_PER_BITS(size); ++i) {
     dst->data[i] |= src->data[i];
@@ -397,13 +403,13 @@ struct tw_bitmap *tw_bitmap_intersection(const struct tw_bitmap *src,
 
   uint64_t count = 0;
 #ifdef USE_AVX512
-  BITMAP_OP_LOOP(__m512i, _mm512_load_si512, _mm512_and_si512,
-                 _mm512_store_si512)
+  BITMAP_OP_LOOP(__m512i, _mm512_loadu_si512, _mm512_and_si512,
+                 _mm512_storeu_si512)
 #elif defined USE_AVX2
-  BITMAP_OP_LOOP(__m256i, _mm256_load_si256, _mm256_and_si256,
-                 _mm256_store_si256)
+  BITMAP_OP_LOOP(__m256i, _mm256_loadu_si256, _mm256_and_si256,
+                 _mm256_storeu_si256)
 #elif defined USE_AVX
-  BITMAP_OP_LOOP(__m128i, _mm_load_si128, _mm_and_si128, _mm_store_si128)
+  BITMAP_OP_LOOP(__m128i, _mm_loadu_si128, _mm_and_si128, _mm_storeu_si128)
 #else
   for (size_t i = 0; i < TW_BITMAP_PER_BITS(size); ++i) {
     dst->data[i] &= src->data[i];
@@ -427,13 +433,13 @@ struct tw_bitmap *tw_bitmap_xor(const struct tw_bitmap *src,
 
   uint64_t count = 0;
 #ifdef USE_AVX512
-  BITMAP_OP_LOOP(__m512i, _mm512_load_si512, _mm512_xor_si512,
-                 _mm512_store_si512)
+  BITMAP_OP_LOOP(__m512i, _mm512_loadu_si512, _mm512_xor_si512,
+                 _mm512_storeu_si512)
 #elif defined USE_AVX2
-  BITMAP_OP_LOOP(__m256i, _mm256_load_si256, _mm256_xor_si256,
-                 _mm256_store_si256)
+  BITMAP_OP_LOOP(__m256i, _mm256_loadu_si256, _mm256_xor_si256,
+                 _mm256_storeu_si256)
 #elif defined USE_AVX
-  BITMAP_OP_LOOP(__m128i, _mm_load_si128, _mm_xor_si128, _mm_store_si128)
+  BITMAP_OP_LOOP(__m128i, _mm_loadu_si128, _mm_xor_si128, _mm_storeu_si128)
 #else
   for (size_t i = 0; i < TW_BITMAP_PER_BITS(size); ++i) {
     dst->data[i] ^= src->data[i];

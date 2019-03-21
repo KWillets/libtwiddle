@@ -6,7 +6,10 @@
 
 #define TW_BITMAP_MAX_BITS (1UL << 48)
 #define TW_BITMAP_MAX_POS (TW_BITMAP_MAX_BITS - 1)
-
+/* the word type of the bitmap array */
+#ifndef BITMAP_TYPE
+#define BITMAP_TYPE uint8_t
+#endif
 /**
  * dense bitmap data structure
  *
@@ -23,7 +26,7 @@ struct tw_bitmap {
   /** number of active bits */
   uint64_t count;
   /** pointer to stored bits */
-  uint64_t *data;
+  BITMAP_TYPE *data;
 };
 
 /**
